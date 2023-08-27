@@ -57,6 +57,7 @@ class Timeware_Propensity_Estimation(nn.Module):
             batch_first=True,
         )
         self.dense1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.linear1 = nn.Linear(self.hidden_size, 1)
 
         self.loss = nn.CrossEntropyLoss()
 
@@ -65,33 +66,42 @@ class Timeware_Propensity_Estimation(nn.Module):
         output_tensor = output.gather(dim=1, index=gather_index)
         return output_tensor.squeeze(1)
 
-    def forward(self,item_seq_emb, target_item, item_emb, seq_len):
+    def forward(self,item_seq_emb, target_item, item_emb, seq_len,masked_item_seq):
         ##IPS not need to backward to the underlying model
         item_emb = item_emb.detach()
         #（掩码 + 位置）
         item_seq_emb = item_seq_emb.detach()
         gru_output, _ = self.gru_layers(item_seq_emb)
+        attention_mask = (masked_item_seq > 0).long()  # [B,L]
+        extended_attention_mask = attention_mask.unsqueeze(-1)  # torch.int64
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         gru_output = self.dense1(gru_output)
         seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len),seq_len - 1))
-        #乘embedding的权重参数item_emb
+
         logits = torch.matmul(seq_output, item_emb.transpose(0, 1))
+        # IPS_score = logits.gather(dim=-1, index=target_item.unsqueeze(-1))
+        # IPS_score = torch.softmax(IPS_score,dim=0)
 
-        IPS_score = torch.softmax(logits,dim=-1)
+        output=self.linear1(gru_output)+extended_attention_mask
+        ipsleanr=torch.softmax(output,1)
+        IPS_score = self.gather_indexes(ipsleanr, torch.max(torch.zeros_like(seq_len), seq_len - 1))
 
-        IPS_score = IPS_score.gather(dim=-1,index=target_item.unsqueeze(-1))
+
+        item_targets = (item_seq_emb > 0).float().view(-1)  # [B*mask_len]
         loss = self.loss(logits, target_item)
         # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
         # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
-        return IPS_score, loss, logits
+        return IPS_score, loss, seq_output
 
 
 
-class DEPS(SequentialRecommender):
+class DEPSADDI(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(DEPSADDI, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -175,7 +185,7 @@ class DEPS(SequentialRecommender):
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
-        self.mlp_hidden_size = [4 * self.hidden_size] + self.mlp_hidden_size
+        self.mlp_hidden_size = [6 * self.hidden_size] + self.mlp_hidden_size
 
         self.dnn_mlp_layers = MLPLayers(self.mlp_hidden_size, activation='Dice', dropout=self.dropout_prob, bn=True)
         self.dnn_predict_layers = nn.Linear(self.mlp_hidden_size[-1], 1)
@@ -450,7 +460,11 @@ class DEPS(SequentialRecommender):
 
         item_emb = torch.cat((item_social_emb,target_item_feat_emb),dim=-1)
         user_emb = torch.cat((user_history_emb,target_user_feat_emb),dim=-1)
-        in_r = torch.cat([user_emb, item_emb], dim=-1)
+        p_item_score, item_IPS_loss, gruitem_logits = self.ItemIPS_Estimation_Net(item_seq_emb, next_items, test_item_emb,
+                                                                               item_seq_len, masked_item_seq)
+        p_user_score, user_IPS_loss, gruuser_logits = self.UserIPS_Estimation_Net(user_seq_emb, user, test_user_emb,
+                                                                               user_seq_len, masked_user_seq)
+        in_r = torch.cat([user_emb, item_emb,gruitem_logits,gruuser_logits], dim=-1)
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         preds = self.sigmoid(preds).squeeze(1)
@@ -462,8 +476,7 @@ class DEPS(SequentialRecommender):
                         / torch.sum(user_targets)
 
 
-        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb,next_items,test_item_emb,item_seq_len)
-        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
+
         dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
         #dual_loss = nn.MSELoss()(item_IPS_loss,user_IPS_loss)
         loss = self.loss(preds,label,p_item_score,p_user_score)
@@ -491,13 +504,33 @@ class DEPS(SequentialRecommender):
         user = interaction[self.USER_ID]
         times = interaction[self.TIME]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        next_items = interaction[self.ITEM_ID]
+
         user_seq,user_seq_len = self.GetUserSeq(test_item,times)
 
         item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,
                                                                                                                    item_seq_len=item_seq_len,user_seq_len=user_seq_len)
         item_emb = torch.cat((torch.mean(user_output*((user_seq >0).float().view(user_seq.size(0),-1,1)),dim=1,keepdim=False),target_item_feat_emb),dim=-1)
         user_emb = torch.cat((torch.mean(item_output*((item_seq >0).float().view(item_seq.size(0),-1,1)),dim=1,keepdim=False),target_user_feat_emb),dim=-1)
-        in_r = torch.cat([user_emb, item_emb], dim=-1)
+
+        test_user_emb = self.user_embedding.weight[:self.n_users]
+        test_item_emb = self.item_embedding.weight[:self.n_items]
+        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb, next_items, test_item_emb,
+                                                                               item_seq_len, item_seq)
+        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb, user, test_user_emb,
+                                                                               user_seq_len, user_seq)
+        in_r = torch.cat([user_emb, item_emb,item_logits,user_logits], dim=-1)
+
+        # print(f"prepi_scores:{p_item_score[48:53, :]},prepu_scores:{p_user_score[28:33, :]}")
+        # clip=0.05
+        # if self.current_step < self.total_step * self.warmup_rate :
+        #     clip=1
+        # pi_scores = torch.clamp(p_item_score, clip, 1)
+        # pu_scores = torch.clamp(p_user_score,clip, 1)
+        # IPS_weight = (1 / pi_scores) * 0.5 + (1 / pu_scores) * (1 - 0.5)
+        # item_logits = item_logits.gather(dim=-1, index=next_items.unsqueeze(-1))
+        # user_logits = user_logits.gather(dim=-1, index=next_items.unsqueeze(-1))
+        # out_r = self.dnn_mlp_layers(in_r*IPS_weight)
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         scores = self.sigmoid(preds).squeeze(1)

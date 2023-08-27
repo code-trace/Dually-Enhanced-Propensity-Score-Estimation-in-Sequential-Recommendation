@@ -31,7 +31,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from recbole.model.abstract_recommender import SequentialRecommender
-from recbole.model.layers import TransformerEncoder,MLPLayers, SequenceAttLayer, ContextSeqEmbLayer
+from recbole.model.layers import TransformerEncoder, MLPLayers, SequenceAttLayer, ContextSeqEmbLayer
 from recbole.utils import InputType
 from torch.nn.init import xavier_normal_, constant_
 from recbole.model.loss import IPSDualBCELoss
@@ -40,13 +40,10 @@ import numpy as np
 import pandas as pd
 
 
-
-
-
 class Timeware_Propensity_Estimation(nn.Module):
-    def __init__(self, hidden_size, dropout_prob, num_layer = 2):
+    def __init__(self, hidden_size, dropout_prob, num_layer=2):
         super(Timeware_Propensity_Estimation, self).__init__()
-        #Since the transformer already encode the sequence information, we only need to calculate the item probability through two layer MLP
+        # Since the transformer already encode the sequence information, we only need to calculate the item probability through two layer MLP
         self.hidden_size = hidden_size
         self.dropout_prob = dropout_prob
         self.gru_layers = nn.GRU(
@@ -65,39 +62,33 @@ class Timeware_Propensity_Estimation(nn.Module):
         output_tensor = output.gather(dim=1, index=gather_index)
         return output_tensor.squeeze(1)
 
-    def forward(self,item_seq_emb, target_item, item_emb, seq_len):
+    def forward(self, item_seq_emb, target_item, item_emb_weight, seq_len):
         ##IPS not need to backward to the underlying model
-        item_emb = item_emb.detach()
-        #（掩码 + 位置）
+        item_emb_weight = item_emb_weight.detach()
         item_seq_emb = item_seq_emb.detach()
         gru_output, _ = self.gru_layers(item_seq_emb)
         gru_output = self.dense1(gru_output)
-        seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len),seq_len - 1))
-        #乘embedding的权重参数item_emb
-        logits = torch.matmul(seq_output, item_emb.transpose(0, 1))
+        seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len), seq_len - 1))
+        logits = torch.matmul(seq_output, item_emb_weight.transpose(0, 1))
 
-        IPS_score = torch.softmax(logits,dim=-1)
+        IPS_score = torch.softmax(logits, dim=-1)
 
-        IPS_score = IPS_score.gather(dim=-1,index=target_item.unsqueeze(-1))
+        IPS_score = IPS_score.gather(dim=-1, index=target_item.unsqueeze(-1))
         loss = self.loss(logits, target_item)
-        # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
-        # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
+
         return IPS_score, loss, logits
 
 
-
-class DEPS(SequentialRecommender):
-
+class COMIDEPS(SequentialRecommender):
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(COMIDEPS, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
         self.n_heads = config['n_heads']
         self.hidden_size = config['hidden_size']
-
 
         self.embedding_size = config['embedding_size']
         self.inner_size = config['inner_size']  # the dimensionality in feed-forward layer
@@ -124,16 +115,18 @@ class DEPS(SequentialRecommender):
         self.IPS_factor = config['IPS_factor']
 
         self.data_type = config['dataset']
-
+        self.interest_num = config['interest_num']
         # load dataset info
         self.item_mask_token = self.n_items
         self.user_mask_token = self.n_users
-        #self.cls_token = 1
+        # self.cls_token = 1
         self.dataset = dataset
 
-        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
-        self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
-
+        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,
+                                                                     dropout_prob=self.dropout_prob)
+        self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,
+                                                                     dropout_prob=self.dropout_prob)
+        self.ComirecSA = ComirecSA(self.hidden_size, self.interest_num)
 
         self.types = ['user', 'item']
         self.user_feat = dataset.get_user_feature()
@@ -181,31 +174,66 @@ class DEPS(SequentialRecommender):
         self.dnn_predict_layers = nn.Linear(self.mlp_hidden_size[-1], 1)
         self.sigmoid = nn.Sigmoid()
 
-
         ##Recbole load sequences is different from ours. To avoid un-fair comparision, we load the item and user sequences in this function
-        self.Item2UserSeq,self.Item2TimeSeq = self.LoadUserSeq()
+        self.Item2UserSeq, self.Item2TimeSeq = self.LoadUserSeq()
 
-        self.total_step = int(config['epochs'] * (self.interaction_num/config['train_batch_size']))
-        self.batch_step = int(self.interaction_num/config['train_batch_size']) * 2
+        self.total_step = int(config['epochs'] * (self.interaction_num / config['train_batch_size']))
+        self.batch_step = int(self.interaction_num / config['train_batch_size']) * 2
 
         self.IPS_training_rate = int(config['IPS_training_rate'])
-
+        self.interest_SA=Interest_SA(self.hidden_size, self.interest_num)
         self.current_step = 0
 
-        self.loss = IPSDualBCELoss(clip=config['IPS_clip'],max_clip=config['IPS_max_clip'],
-                                   total_steps=self.total_step, warmup_rate=self.warmup_rate,alpha=config['alpha'])
+        self.loss = IPSDualBCELoss(clip=config['IPS_clip'], max_clip=config['IPS_max_clip'],
+                                   total_steps=self.total_step, warmup_rate=self.warmup_rate, alpha=config['alpha'])
 
         self.apply(self._init_weights)
 
+    def forward(self, user, item_seq, next_items, user_seq, item_seq_len, user_seq_len):
 
-    def GetUserSeq(self,item_id,time):
+        target_user_feat_emb = self.user_embedding(user)
+        user_feat_list = self.user_embedding(user_seq)
+
+        item_feat_list = self.item_embedding(item_seq)
+        target_item_feat_emb = self.item_embedding(next_items)
+
+        position_ids = torch.arange(self.max_seq_length, dtype=torch.long, device=item_seq.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
+        position_embedding = self.item_position_embedding(position_ids)
+        # label_embedding = self.item_label_embedding(item_label_seq)
+
+        input_emb_item = item_feat_list + position_embedding
+        input_emb_item = self.LayerNorm(input_emb_item)
+        input_emb_item = self.dropout(input_emb_item)
+        extended_attention_mask = self.get_attention_mask(item_seq, item_seq_len)
+
+        # print(extended_attention_mask[0:2])
+        item_output = self.item_encoder(input_emb_item, extended_attention_mask, output_all_encoded_layers=True)
+        item_output = item_output[-1]
+
+        position_ids = torch.arange(self.max_user_seq_length, dtype=torch.long, device=user_seq.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(user_seq)
+        position_embedding = self.user_position_embedding(position_ids)
+        # label_embedding = self.user_label_embedding(user_label_seq)
+
+        input_emb_user = user_feat_list + position_embedding
+        input_emb_user = self.LayerNorm(input_emb_user)
+        input_emb_user = self.dropout(input_emb_user)
+        extended_attention_mask = self.get_attention_mask(user_seq, user_seq_len)
+        user_output = self.user_encoder(input_emb_user, extended_attention_mask, output_all_encoded_layers=True)
+        user_output = user_output[-1]
+
+        # exit(0)
+        return item_output, target_item_feat_emb, user_output, target_user_feat_emb, input_emb_item, input_emb_user  # [B H]
+
+    def GetUserSeq(self, item_id, time):
         items = item_id.detach().cpu().numpy()
         times = time.detach().cpu().numpy()
         user_seq = []
         user_seq_length = []
 
         for i in range(len(items)):
-            #init_time = 0
+            # init_time = 0
             index = 0
             item = items[i]
             if item in self.Item2TimeSeq:
@@ -218,61 +246,59 @@ class DEPS(SequentialRecommender):
                     user_seq_length.append(0)
                     user_seq.append([0] * self.max_user_seq_length)
                 else:
-                    min_pos = max(0,index-self.max_user_seq_length)
-                    length = index-min_pos
-                    user_seq.append(self.Item2UserSeq[item][min_pos:index] + [0] * (self.max_user_seq_length-length))
+                    min_pos = max(0, index - self.max_user_seq_length)
+                    length = index - min_pos
+                    user_seq.append(self.Item2UserSeq[item][min_pos:index] + [0] * (self.max_user_seq_length - length))
                     user_seq_length.append(length)
             else:
                 user_seq_length.append(0)
                 user_seq.append([0] * self.max_user_seq_length)
 
-        return torch.LongTensor(user_seq).to(self.device),torch.LongTensor(user_seq_length).to(self.device)
-
+        return torch.LongTensor(user_seq).to(self.device), torch.LongTensor(user_seq_length).to(self.device)
 
     def _init_weights(self, module):
         """ Initialize the weights """
         if isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=0.1)
-            #xavier_normal_(module.weight.data)
+            # xavier_normal_(module.weight.data)
         elif isinstance(module, nn.Linear):
             xavier_normal_(module.weight.data)
 
     def LoadUserSeq(self):
         import os
-        train,valid,test = pd.read_csv(os.path.join("dataset",self.data_type,self.data_type+".train.inter"),delimiter='\t'),\
-        pd.read_csv(os.path.join("dataset",self.data_type,self.data_type+".valid.inter"),delimiter='\t'),\
-        pd.read_csv(os.path.join("dataset",self.data_type,self.data_type+".test.inter"),delimiter='\t')
+        train, valid, test = pd.read_csv(os.path.join("dataset", self.data_type, self.data_type + ".train.inter"),
+                                         delimiter='\t'), \
+            pd.read_csv(os.path.join("dataset", self.data_type, self.data_type + ".valid.inter"), delimiter='\t'), \
+            pd.read_csv(os.path.join("dataset", self.data_type, self.data_type + ".test.inter"), delimiter='\t')
 
-        all = pd.concat((train,valid,test),axis=0)
+        all = pd.concat((train, valid, test), axis=0)
 
         self.interaction_num = len(train)
 
-        iid_field,uid_field,label_field,iid_list_field,uid_list_field,time_field = all.columns
-        all.sort_values(by=[time_field], ascending=True,inplace=True)
+        iid_field, uid_field, label_field, iid_list_field, uid_list_field, time_field = all.columns
+        all.sort_values(by=[time_field], ascending=True, inplace=True)
         Item2UserSeq = {}
         Item2TimeSeq = {}
         for i in range(len(all)):
-            item_id,user_id,uid_list,time = all.iloc[i,0],all.iloc[i,1],all.iloc[i,4],all.iloc[i,5]
-            item_id = self.dataset.token2id(self.dataset.iid_field,str(item_id))
-            user_id = self.dataset.token2id(self.dataset.uid_field,str(user_id))
+            item_id, user_id, uid_list, time = all.iloc[i, 0], all.iloc[i, 1], all.iloc[i, 4], all.iloc[i, 5]
+            item_id = self.dataset.token2id(self.dataset.iid_field, str(item_id))
+            user_id = self.dataset.token2id(self.dataset.uid_field, str(user_id))
             if item_id not in Item2UserSeq.keys():
                 Item2UserSeq[item_id] = []
                 Item2TimeSeq[item_id] = []
             Item2UserSeq[item_id].append(user_id)
             Item2TimeSeq[item_id].append(int(time))
 
-
-        return Item2UserSeq,Item2TimeSeq
+        return Item2UserSeq, Item2TimeSeq
 
     def get_attention_mask(self, seq, seq_len):
         """Generate bidirectional attention mask for multi-head attention."""
 
-        attention_mask = (seq > 0).long() #[B,L]
+        attention_mask = (seq > 0).long()  # [B,L]
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         return extended_attention_mask
-
 
     def _neg_sample(self, item_set):
         item = random.randint(1, self.n_items - 1)
@@ -286,7 +312,7 @@ class DEPS(SequentialRecommender):
         sequence = sequence[-max_length:]  # truncate according to the max_length
         return sequence
 
-    def reconstruct_train_data(self, seq, mask_length, pad_item = True):
+    def reconstruct_train_data(self, seq, mask_length, pad_item=True):
         """
         Mask item sequence for MLM training in the transformers.
         """
@@ -297,11 +323,11 @@ class DEPS(SequentialRecommender):
 
         masked_sequences = []
         pos_values = []
-        #neg_items = []
+        # neg_items = []
         masked_index = []
         for m, instance in enumerate(sequence_instances):
             # WE MUST USE 'copy()' HERE!
-            #valid_length = seq_len[m].item()
+            # valid_length = seq_len[m].item()
             masked_sequence = instance.copy()
             pos = []
             # neg_item = []
@@ -319,11 +345,11 @@ class DEPS(SequentialRecommender):
                         masked_sequence[index_id] = self.item_mask_token
                     else:
                         masked_sequence[index_id] = self.user_mask_token
-                    index_ids.append(index_id) ####skip the cls vector
+                    index_ids.append(index_id)  ####skip the cls vector
 
             masked_sequences.append(masked_sequence)
             pos_values.append(self._padding_sequence(pos, mask_length))
-            #neg_items.append(self._padding_sequence(neg_item, self.mask_item_length))
+            # neg_items.append(self._padding_sequence(neg_item, self.mask_item_length))
             masked_index.append(self._padding_sequence(index_ids, mask_length))
 
         # [B Len]
@@ -335,44 +361,6 @@ class DEPS(SequentialRecommender):
 
         masked_index = torch.tensor(masked_index, dtype=torch.long, device=device).view(batch_size, -1)
         return masked_sequences, pos_values, masked_index
-
-
-    def forward(self, user, item_seq, next_items, user_seq, item_seq_len, user_seq_len):
-
-        target_user_feat_emb = self.user_embedding(user)
-        user_feat_list = self.user_embedding(user_seq)
-
-        item_feat_list = self.item_embedding(item_seq)
-        target_item_feat_emb = self.item_embedding(next_items)
-
-        position_ids = torch.arange(self.max_seq_length, dtype=torch.long, device=item_seq.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
-        position_embedding = self.item_position_embedding(position_ids)
-        #label_embedding = self.item_label_embedding(item_label_seq)
-
-        input_emb_item = item_feat_list + position_embedding
-        input_emb_item = self.LayerNorm(input_emb_item)
-        input_emb_item = self.dropout(input_emb_item)
-        extended_attention_mask = self.get_attention_mask(item_seq,item_seq_len)
-
-        #print(extended_attention_mask[0:2])
-        item_output = self.item_encoder(input_emb_item, extended_attention_mask, output_all_encoded_layers=True)
-        item_output = item_output[-1]
-
-        position_ids = torch.arange(self.max_user_seq_length, dtype=torch.long, device=user_seq.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(user_seq)
-        position_embedding = self.user_position_embedding(position_ids)
-        #label_embedding = self.user_label_embedding(user_label_seq)
-
-        input_emb_user = user_feat_list + position_embedding
-        input_emb_user = self.LayerNorm(input_emb_user)
-        input_emb_user = self.dropout(input_emb_user)
-        extended_attention_mask = self.get_attention_mask(user_seq, user_seq_len)
-        user_output = self.user_encoder(input_emb_user, extended_attention_mask, output_all_encoded_layers=True)
-        user_output = user_output[-1]
-
-        #exit(0)
-        return item_output,target_item_feat_emb,user_output,target_user_feat_emb,input_emb_item,input_emb_user  # [B H]
 
     def multi_hot_embed(self, masked_index, max_length):
         """
@@ -401,31 +389,35 @@ class DEPS(SequentialRecommender):
         times = interaction[self.TIME]
         user = interaction[self.USER_ID]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        #这个为什么是数字，位置吗
+
         next_items = interaction[self.ITEM_ID]
-        #user_seq为不同item下的用户序列，user_seq_len为每个iten下的用户序列长度
-        user_seq,user_seq_len = self.GetUserSeq(next_items,times)
+
+        user_seq, user_seq_len = self.GetUserSeq(next_items, times)
 
         label = interaction[self.LABEL_FIELD]
 
         self.mask_user_length = int(self.mask_ratio * self.max_user_seq_length)
         self.mask_item_length = int(self.mask_ratio * self.max_seq_length)
 
-        masked_item_seq, pos_items, masked_item_index = self.reconstruct_train_data(item_seq,self.mask_item_length, pad_item=True)
-        masked_user_seq, pos_users, masked_user_index = self.reconstruct_train_data(user_seq,self.mask_user_length ,pad_item=False)
+        masked_item_seq, pos_items, masked_item_index = self.reconstruct_train_data(item_seq, self.mask_item_length,
+                                                                                    pad_item=True)
+        masked_user_seq, pos_users, masked_user_index = self.reconstruct_train_data(user_seq, self.mask_user_length,
+                                                                                    pad_item=False)
 
-        item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=masked_item_seq, next_items=next_items, user_seq=masked_user_seq,
-                                                                                                                   item_seq_len=item_seq_len, user_seq_len=user_seq_len)
+        item_output, target_item_feat_emb, user_output, target_user_feat_emb, item_seq_emb, user_seq_emb = self.forward(
+            user=user, item_seq=masked_item_seq, next_items=next_items, user_seq=masked_user_seq,
+            item_seq_len=item_seq_len, user_seq_len=user_seq_len)
 
         pred_item_index_map = self.multi_hot_embed(masked_item_index, masked_item_seq.size(-1))  # [B*mask_len max_len]
         # [B mask_len] -> [B mask_len max_len] multi hot
-        pred_item_index_map = pred_item_index_map.view(masked_item_index.size(0), masked_item_index.size(1), -1)  # [B mask_len max_len]
+        pred_item_index_map = pred_item_index_map.view(masked_item_index.size(0), masked_item_index.size(1),
+                                                       -1)  # [B mask_len max_len]
         # [B mask_len max_len] * [B max_len H] -> [B mask_len H]
         # only calculate loss for masked position
         seq_output = torch.bmm(pred_item_index_map, item_output)  # [B mask_len H]
 
         loss_fct = nn.CrossEntropyLoss(reduction='none')
-        #test_user_emb,test_item_emb = self.embedding_layer.GetAllFeature(self.n_users,self.n_items)
+        # test_user_emb,test_item_emb = self.embedding_layer.GetAllFeature(self.n_users,self.n_items)
         test_user_emb = self.user_embedding.weight[:self.n_users]
         test_item_emb = self.item_embedding.weight[:self.n_items]
 
@@ -434,7 +426,8 @@ class DEPS(SequentialRecommender):
 
         pred_user_index_map = self.multi_hot_embed(masked_user_index, masked_user_seq.size(-1))  # [B*mask_len max_len]
         # [B mask_len] -> [B mask_len max_len] multi hot
-        pred_user_index_map = pred_user_index_map.view(masked_user_index.size(0), masked_user_index.size(1), -1)  # [B mask_len max_len]
+        pred_user_index_map = pred_user_index_map.view(masked_user_index.size(0), masked_user_index.size(1),
+                                                       -1)  # [B mask_len max_len]
         # [B mask_len max_len] * [B max_len H] -> [B mask_len H]
         # only calculate loss for masked position
         seq_output = torch.bmm(pred_user_index_map, user_output)  # [B mask_len H]
@@ -442,48 +435,56 @@ class DEPS(SequentialRecommender):
         user_logits = torch.matmul(seq_output, test_user_emb.transpose(0, 1))  # [B mask_len item_num]
         user_targets = (masked_user_index > 0).float().view(-1)  # [B*mask_len]
 
+        item_social_emb = torch.mean(user_output * ((masked_user_seq > 0).float().view(masked_user_seq.size(0), -1, 1)),
+                                     dim=1, keepdim=False)
 
-        item_social_emb = torch.mean(user_output*((masked_user_seq>0).float().view(masked_user_seq.size(0),-1,1)),dim=1,keepdim=False)
+        user_history_emb = torch.mean(
+            item_output * ((masked_item_seq > 0).float().view(masked_item_seq.size(0), -1, 1)), dim=1, keepdim=False)
 
-        user_history_emb = torch.mean(item_output*((masked_item_seq>0).float().view(masked_item_seq.size(0),-1,1)),dim=1,keepdim=False)
-
-
-        item_emb = torch.cat((item_social_emb,target_item_feat_emb),dim=-1)
-        user_emb = torch.cat((user_history_emb,target_user_feat_emb),dim=-1)
+        item_emb = torch.cat((item_social_emb, target_item_feat_emb), dim=-1)
+        user_emb = torch.cat((user_history_emb, target_user_feat_emb), dim=-1)
         in_r = torch.cat([user_emb, item_emb], dim=-1)
-        out_r = self.dnn_mlp_layers(in_r)
-        preds = self.dnn_predict_layers(out_r)
-        preds = self.sigmoid(preds).squeeze(1)
+        comi_output_dict = self.ComirecSA(item_seq_emb, next_items, test_item_emb, target_item_feat_emb,
+                                          masked_item_seq)
+        comi_loss = comi_output_dict['loss']
+        multi_interest_emb = comi_output_dict['multi_interest_emb']
+        in_r = torch.cat([in_r, multi_interest_emb.view(multi_interest_emb.size(0), -1)], dim=-1)
+        cos_res=self.interest_SA(in_r,target_item_feat_emb)
+        # out_r = self.dnn_mlp_layers(cos_res)
+        # preds = self.dnn_predict_layers(out_r)
+        # preds = self.sigmoid(preds).squeeze(1)
 
-        item_mlm_loss = torch.sum(loss_fct(item_logits.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * item_targets) \
+        item_mlm_loss = torch.sum(
+            loss_fct(item_logits.view(-1, test_item_emb.size(0)), pos_items.view(-1)) * item_targets) \
                         / torch.sum(item_targets)
 
-        user_mlm_loss = torch.sum(loss_fct(user_logits.view(-1, test_user_emb.size(0)), pos_users.view(-1)) * user_targets) \
+        user_mlm_loss = torch.sum(
+            loss_fct(user_logits.view(-1, test_user_emb.size(0)), pos_users.view(-1)) * user_targets) \
                         / torch.sum(user_targets)
 
+        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb, next_items, test_item_emb,
+                                                                               item_seq_len)
+        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb, user, test_user_emb,
+                                                                               user_seq_len)
+        dual_loss = self.DualLoss(item_IPS_loss, user_IPS_loss)
 
-        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb,next_items,test_item_emb,item_seq_len)
-        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
-        dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
-        #dual_loss = nn.MSELoss()(item_IPS_loss,user_IPS_loss)
-        loss = self.loss(preds,label,p_item_score,p_user_score)
+        loss = self.loss(cos_res, label, p_item_score, p_user_score)
         print(f"item_IPS_loss:{item_IPS_loss}，user_IPS_loss:{user_IPS_loss},dual_loss:{dual_loss}\
-        ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
+                ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},comi_loss:{comi_loss},loss:{loss}")
         if self.training:
             self.current_step = self.current_step + 1
             self.loss.update()
             if self.current_step > self.warmup_rate * self.total_step:
-                #unbiased learning phrase
+                # unbiased learning phrase
                 self.mask_ratio = self.min_mask_ratio
-                if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
-                    return loss
+                if self.current_step % (self.batch_step * (1 + self.IPS_training_rate)) <= self.batch_step:
+                    return loss*2 + comi_loss
                 else:
-                    return item_IPS_loss  + user_IPS_loss + dual_loss
+                    return item_IPS_loss + user_IPS_loss + dual_loss + comi_loss
             else:
-                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss + dual_loss
+                return item_mlm_loss + user_mlm_loss + item_IPS_loss + user_IPS_loss + dual_loss + comi_loss
 
         return loss
-
 
     def predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
@@ -491,17 +492,116 @@ class DEPS(SequentialRecommender):
         user = interaction[self.USER_ID]
         times = interaction[self.TIME]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        user_seq,user_seq_len = self.GetUserSeq(test_item,times)
+        user_seq, user_seq_len = self.GetUserSeq(test_item, times)
 
-        item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,
-                                                                                                                   item_seq_len=item_seq_len,user_seq_len=user_seq_len)
-        item_emb = torch.cat((torch.mean(user_output*((user_seq >0).float().view(user_seq.size(0),-1,1)),dim=1,keepdim=False),target_item_feat_emb),dim=-1)
-        user_emb = torch.cat((torch.mean(item_output*((item_seq >0).float().view(item_seq.size(0),-1,1)),dim=1,keepdim=False),target_user_feat_emb),dim=-1)
+        item_output, target_item_feat_emb, user_output, target_user_feat_emb, item_seq_emb, user_seq_emb = self.forward(
+            user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,
+            item_seq_len=item_seq_len, user_seq_len=user_seq_len)
+        item_emb = torch.cat((torch.mean(user_output * ((user_seq > 0).float().view(user_seq.size(0), -1, 1)), dim=1,
+                                         keepdim=False), target_item_feat_emb), dim=-1)
+        user_emb = torch.cat((torch.mean(item_output * ((item_seq > 0).float().view(item_seq.size(0), -1, 1)), dim=1,
+                                         keepdim=False), target_user_feat_emb), dim=-1)
         in_r = torch.cat([user_emb, item_emb], dim=-1)
-        out_r = self.dnn_mlp_layers(in_r)
-        preds = self.dnn_predict_layers(out_r)
-        scores = self.sigmoid(preds).squeeze(1)
+        weight_item_emb = self.item_embedding.weight[:self.n_items]
+        comi_output_dict = self.ComirecSA(item_seq_emb, None, weight_item_emb, target_item_feat_emb, item_seq,
+                                          train=False)
+        multi_interest_emb = comi_output_dict['multi_interest_emb']
 
-        return scores
+        in_r = torch.cat([in_r, multi_interest_emb.view(multi_interest_emb.size(0), -1)], dim=-1)
+        cos_res = self.interest_SA(in_r, target_item_feat_emb)
+        # out_r = self.dnn_mlp_layers(in_r)
+        # preds = self.dnn_predict_layers(out_r)
+        # scores = self.sigmoid(preds).squeeze(1)
+
+        return cos_res
 
 
+class MultiInterest_SA(nn.Module):
+    def __init__(self, hidden_size, interest_num, d=None):
+        super(MultiInterest_SA, self).__init__()
+        self.hidden_size = hidden_size
+        self.interest_num = interest_num
+        if d == None:
+            self.d = self.hidden_size * 4
+        self.linear1 = nn.Linear(self.hidden_size, self.d)
+        self.linear2 = nn.Linear(self.d, self.interest_num)
+
+    def forward(self, item_seq_emb, masked_item_seq):
+        '''
+        seq_emb : batch,seq,emb
+        mask : batch,seq,1
+        '''
+        attention_mask = (masked_item_seq > 0).long()  # [B,L]
+        extended_attention_mask = attention_mask.unsqueeze(-1)  # torch.int64
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        output = self.linear1(item_seq_emb + extended_attention_mask)
+        output = torch.tanh(output)
+        A = self.linear2(output)
+        A = F.softmax(A, dim=1)
+        A = A.transpose(2, 1)
+        multi_interest_emb = torch.matmul(A, item_seq_emb)
+        return multi_interest_emb
+
+
+class ComirecSA(nn.Module):
+    def __init__(self, hidden_size, interest_num):
+        super(ComirecSA, self).__init__()
+
+        self.multi_interest_layer = MultiInterest_SA(hidden_size, interest_num)
+        self.loss_fun = nn.CrossEntropyLoss()
+        self.linear3 = nn.Linear(hidden_size, hidden_size * 4)
+
+    def forward(self, item_seq_emb, target_item, item_emb_weight, target_item_feat_emb, masked_item_seq, train=True):
+
+        item_seq_emb = item_seq_emb.detach()
+        item_emb_weight = item_emb_weight.detach()
+        target_item_feat_emb = target_item_feat_emb.detach()
+        # item_seq_emb = torch.matmul(item_seq_emb, item_emb_weight.transpose(0, 1))
+        multi_interest_emb = self.multi_interest_layer(item_seq_emb, masked_item_seq)  # Batch,K,Emb
+        cos_res = torch.bmm(multi_interest_emb, target_item_feat_emb.squeeze(1).unsqueeze(-1))
+        k_index = torch.max(cos_res, dim=1)[1]
+        best_interest_emb = torch.rand((multi_interest_emb.shape[0], multi_interest_emb.shape[2]),
+                                       device=multi_interest_emb.device)
+        for k in range(multi_interest_emb.shape[0]):
+            best_interest_emb[k, :] = multi_interest_emb[k, k_index[k], :]
+        if train:
+            scores = torch.matmul(best_interest_emb, item_emb_weight.transpose(0, 1))
+            loss = self.loss_fun(scores, target_item)
+            output_dict = {
+                'multi_interest_emb': best_interest_emb,
+                'loss': loss,
+            }
+        else:
+
+            output_dict = {
+                'multi_interest_emb': best_interest_emb,
+            }
+        return output_dict
+
+
+
+class Interest_SA(nn.Module):
+    def __init__(self, hidden_size, interest_num, d=None):
+        super(Interest_SA, self).__init__()
+        if d == None:
+            self.d =hidden_size * 4
+        self.hidden_size=hidden_size*5
+        self.linear1 = nn.Linear(self.hidden_size, self.d)
+        self.linear2 = nn.Linear(self.d, 5)
+        print(f"hidden_size{hidden_size}")
+
+    def forward(self, item_seq_emb, target_item_feat_emb):
+        '''
+        seq_emb : batch,seq,emb
+        mask : batch,seq,1
+        '''
+
+        output = self.linear1(item_seq_emb)
+        output = torch.tanh(output)
+        A = self.linear2(output)
+        A = F.softmax(A, dim=1).unsqueeze(1)
+        #A = A.transpose(2, 1)
+        multi_interest_emb = torch.matmul(A, item_seq_emb.view(item_seq_emb.size(0),A.size(-1),-1))
+        cos_res = torch.bmm(multi_interest_emb, target_item_feat_emb.squeeze(1).unsqueeze(-1))
+        return   nn.Sigmoid()(cos_res).squeeze(1).squeeze(1)

@@ -86,12 +86,12 @@ class Timeware_Propensity_Estimation(nn.Module):
 
 
 
-class DEPS(SequentialRecommender):
+class DEPSCHLOSS(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(DEPSCHLOSS, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -476,11 +476,11 @@ class DEPS(SequentialRecommender):
                 #unbiased learning phrase
                 self.mask_ratio = self.min_mask_ratio
                 if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
-                    return loss
+                    return loss*10+item_IPS_loss  + user_IPS_loss
                 else:
-                    return item_IPS_loss  + user_IPS_loss + dual_loss
+                    return loss*10+item_IPS_loss  + user_IPS_loss
             else:
-                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss + dual_loss
+                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss
 
         return loss
 

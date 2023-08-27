@@ -86,12 +86,12 @@ class Timeware_Propensity_Estimation(nn.Module):
 
 
 
-class DEPS(SequentialRecommender):
+class DEPSWOD(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(DEPSWOD, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -467,6 +467,7 @@ class DEPS(SequentialRecommender):
         dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
         #dual_loss = nn.MSELoss()(item_IPS_loss,user_IPS_loss)
         loss = self.loss(preds,label,p_item_score,p_user_score)
+        d_loss = nn.MSELoss()(item_IPS_loss+user_IPS_loss, loss*20)
         print(f"item_IPS_loss:{item_IPS_loss}，user_IPS_loss:{user_IPS_loss},dual_loss:{dual_loss}\
         ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
         if self.training:
@@ -476,11 +477,11 @@ class DEPS(SequentialRecommender):
                 #unbiased learning phrase
                 self.mask_ratio = self.min_mask_ratio
                 if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
-                    return loss
+                    return loss*2+d_loss
                 else:
-                    return item_IPS_loss  + user_IPS_loss + dual_loss
+                    return item_IPS_loss  + user_IPS_loss+dual_loss*2+d_loss*2
             else:
-                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss + dual_loss
+                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss+dual_loss*2+d_loss*2
 
         return loss
 

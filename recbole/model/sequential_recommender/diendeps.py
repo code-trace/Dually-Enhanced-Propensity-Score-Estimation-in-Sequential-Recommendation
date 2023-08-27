@@ -38,23 +38,38 @@ from recbole.model.loss import IPSDualBCELoss
 import numpy as np
 
 import pandas as pd
-
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
 
 
 
 
 class Timeware_Propensity_Estimation(nn.Module):
-    def __init__(self, hidden_size, dropout_prob, num_layer = 2):
+    def __init__(self, hidden_size, dropout_prob,config,dataset,num_layer = 2):
         super(Timeware_Propensity_Estimation, self).__init__()
         #Since the transformer already encode the sequence information, we only need to calculate the item probability through two layer MLP
         self.hidden_size = hidden_size
         self.dropout_prob = dropout_prob
+        self.device = config['device']
+        self.gru = config['gru_type']
+        self.embedding_size = config['embedding_size']
+        self.mlp_hidden_size = config['mlp_hidden_size']
+        self.max_seq_length = config['MAX_ITEM_LIST_LENGTH']
         self.gru_layers = nn.GRU(
             input_size=self.hidden_size,
             hidden_size=self.hidden_size,
             num_layers=num_layer,
             bias=False,
             batch_first=True,
+        )
+        self.item_feat = dataset.get_item_feature()
+        num_item_feature = len(self.item_feat.interaction)
+
+        item_feat_dim = num_item_feature * self.hidden_size
+        mask_mat = torch.arange(self.max_seq_length).to(self.device).view(1, -1)  # init mask
+        # init sizes of used layers
+        self.att_list = [4 * num_item_feature * self.hidden_size] + self.mlp_hidden_size
+        self.interest_evolution = InterestEvolvingLayer(
+            mask_mat, item_feat_dim, item_feat_dim, self.att_list, gru=self.gru
         )
         self.dense1 = nn.Linear(self.hidden_size, self.hidden_size)
 
@@ -65,7 +80,7 @@ class Timeware_Propensity_Estimation(nn.Module):
         output_tensor = output.gather(dim=1, index=gather_index)
         return output_tensor.squeeze(1)
 
-    def forward(self,item_seq_emb, target_item, item_emb, seq_len):
+    def forward(self,item_seq_emb, target_item, item_emb, seq_len,target_item_feat_emb):
         ##IPS not need to backward to the underlying model
         item_emb = item_emb.detach()
         #（掩码 + 位置）
@@ -79,19 +94,27 @@ class Timeware_Propensity_Estimation(nn.Module):
         IPS_score = torch.softmax(logits,dim=-1)
 
         IPS_score = IPS_score.gather(dim=-1,index=target_item.unsqueeze(-1))
-        loss = self.loss(logits, target_item)
+        aux_loss = self.loss(logits, target_item)
         # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
         # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
-        return IPS_score, loss, logits
+        #return IPS_score, loss, logits
+        evolution = self.interest_evolution(target_item_feat_emb, gru_output, seq_len)
 
+        # dien_in = torch.cat([evolution, target_item_feat_emb, user_feat_list], dim=-1)
+        # # input the DNN to get the prediction score
+        # dien_out = self.dnn_mlp_layers(dien_in)
+        # preds = self.dnn_predict_layer(dien_out)
+        # preds = self.sigmoid(preds)
 
+        #return preds.squeeze(1), aux_loss
+        return aux_loss,evolution
 
-class DEPS(SequentialRecommender):
+class DIENDEPS(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(DIENDEPS, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -131,8 +154,8 @@ class DEPS(SequentialRecommender):
         #self.cls_token = 1
         self.dataset = dataset
 
-        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
-        self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
+        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob,config =config,dataset=dataset )
+        #self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob,config =config,dataset=dataset )
 
 
         self.types = ['user', 'item']
@@ -175,7 +198,7 @@ class DEPS(SequentialRecommender):
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
-        self.mlp_hidden_size = [4 * self.hidden_size] + self.mlp_hidden_size
+        self.mlp_hidden_size = [5 * self.hidden_size] + self.mlp_hidden_size
 
         self.dnn_mlp_layers = MLPLayers(self.mlp_hidden_size, activation='Dice', dropout=self.dropout_prob, bn=True)
         self.dnn_predict_layers = nn.Linear(self.mlp_hidden_size[-1], 1)
@@ -450,7 +473,8 @@ class DEPS(SequentialRecommender):
 
         item_emb = torch.cat((item_social_emb,target_item_feat_emb),dim=-1)
         user_emb = torch.cat((user_history_emb,target_user_feat_emb),dim=-1)
-        in_r = torch.cat([user_emb, item_emb], dim=-1)
+        item_IPS_loss, item_gruout = self.ItemIPS_Estimation_Net(item_seq_emb, next_items, test_item_emb,item_seq_len,target_item_feat_emb)
+        in_r = torch.cat([user_emb, item_emb,item_gruout], dim=-1)
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         preds = self.sigmoid(preds).squeeze(1)
@@ -462,13 +486,13 @@ class DEPS(SequentialRecommender):
                         / torch.sum(user_targets)
 
 
-        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb,next_items,test_item_emb,item_seq_len)
-        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
-        dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
-        #dual_loss = nn.MSELoss()(item_IPS_loss,user_IPS_loss)
-        loss = self.loss(preds,label,p_item_score,p_user_score)
-        print(f"item_IPS_loss:{item_IPS_loss}，user_IPS_loss:{user_IPS_loss},dual_loss:{dual_loss}\
-        ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
+
+        #p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
+        #dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
+        loss = F.binary_cross_entropy(preds, label, reduction='mean')
+        #loss = self.loss(preds,label,p_item_score,p_user_score)
+        # print(f"item_IPS_loss:{item_IPS_loss}，\
+        # ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
         if self.training:
             self.current_step = self.current_step + 1
             self.loss.update()
@@ -476,11 +500,11 @@ class DEPS(SequentialRecommender):
                 #unbiased learning phrase
                 self.mask_ratio = self.min_mask_ratio
                 if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
-                    return loss
+                    return loss*10+item_IPS_loss
                 else:
-                    return item_IPS_loss  + user_IPS_loss + dual_loss
+                    return loss*10+item_IPS_loss
             else:
-                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss + dual_loss
+                return item_mlm_loss+user_mlm_loss +  item_IPS_loss
 
         return loss
 
@@ -492,12 +516,14 @@ class DEPS(SequentialRecommender):
         times = interaction[self.TIME]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         user_seq,user_seq_len = self.GetUserSeq(test_item,times)
-
+        test_item_emb = self.item_embedding.weight[:self.n_items]
         item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,
                                                                                                                    item_seq_len=item_seq_len,user_seq_len=user_seq_len)
         item_emb = torch.cat((torch.mean(user_output*((user_seq >0).float().view(user_seq.size(0),-1,1)),dim=1,keepdim=False),target_item_feat_emb),dim=-1)
         user_emb = torch.cat((torch.mean(item_output*((item_seq >0).float().view(item_seq.size(0),-1,1)),dim=1,keepdim=False),target_user_feat_emb),dim=-1)
-        in_r = torch.cat([user_emb, item_emb], dim=-1)
+        item_IPS_loss, item_gruout = self.ItemIPS_Estimation_Net(item_seq_emb, test_item, test_item_emb, item_seq_len,
+                                                                 target_item_feat_emb)
+        in_r = torch.cat([user_emb, item_emb,item_gruout], dim=-1)
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         scores = self.sigmoid(preds).squeeze(1)
@@ -505,3 +531,154 @@ class DEPS(SequentialRecommender):
         return scores
 
 
+class InterestEvolvingLayer(nn.Module):
+    """As the joint influence from external environment and internal cognition, different kinds of user interests are
+    evolving over time. Interest Evolving Layer can capture interest evolving process that is relative to the target
+    item.
+    """
+
+    def __init__(
+        self,
+        mask_mat,
+        input_size,
+        rnn_hidden_size,
+        att_hidden_size=(80, 40),
+        activation='sigmoid',
+        softmax_stag=False,
+        gru='GRU'
+    ):
+        super(InterestEvolvingLayer, self).__init__()
+
+        self.mask_mat = mask_mat
+        self.gru = gru
+
+        self.attention_layer = SequenceAttLayer(mask_mat, att_hidden_size, activation, softmax_stag, True)
+        self.dynamic_rnn = DynamicRNN(input_size=input_size, hidden_size=rnn_hidden_size, gru=gru)
+
+    def final_output(self, outputs, keys_length):
+        """get the last effective value in the interest evolution sequence
+        Args:
+            outputs (torch.Tensor): the output of `DynamicRNN` after `pad_packed_sequence`
+            keys_length (torch.Tensor): the true length of the user history sequence
+
+        Returns:
+            torch.Tensor: The user's CTR for the next item
+        """
+        batch_size, hist_len, _ = outputs.shape  # [B, T, H]
+
+        mask = (
+            torch.arange(hist_len, device=keys_length.device).repeat(batch_size, 1) == (keys_length.view(-1, 1) - 1)
+        )
+
+        return outputs[mask]
+
+    def forward(self, queries, keys, keys_length):
+        hist_len = keys.shape[1]  # T
+        keys_length_cpu = keys_length.cpu()
+        if self.gru == 'GRU':
+            packed_keys = pack_padded_sequence(
+                input=keys, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
+            )
+            packed_rnn_outputs, _ = self.dynamic_rnn(packed_keys)
+            rnn_outputs, _ = pad_packed_sequence(
+                packed_rnn_outputs, batch_first=True, padding_value=0.0, total_length=hist_len
+            )
+            att_outputs = self.attention_layer(queries, rnn_outputs, keys_length)
+            outputs = att_outputs.squeeze(1)
+
+        # AIGRU
+        elif self.gru == 'AIGRU':
+            att_outputs = self.attention_layer(queries, keys, keys_length)
+            interest = keys * att_outputs.transpose(1, 2)
+            packed_rnn_outputs = pack_padded_sequence(
+                interest, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
+            )
+            _, outputs = self.dynamic_rnn(packed_rnn_outputs)
+            outputs = outputs.squeeze(0)
+
+        elif self.gru == 'AGRU' or self.gru == 'AUGRU':
+            att_outputs = self.attention_layer(queries, keys, keys_length).squeeze(1)  # [B, T]
+            packed_rnn_outputs = pack_padded_sequence(
+                keys, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
+            )
+            packed_att_outputs = pack_padded_sequence(
+                att_outputs, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
+            )
+            outputs = self.dynamic_rnn(packed_rnn_outputs, packed_att_outputs)
+            outputs, _ = pad_packed_sequence(outputs, batch_first=True, padding_value=0.0, total_length=hist_len)
+            outputs = self.final_output(outputs, keys_length)  # [B, H]
+
+        return outputs
+
+class DynamicRNN(nn.Module):
+
+    def __init__(self, input_size, hidden_size, bias=True, gru='AGRU'):
+        super(DynamicRNN, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        self.rnn = AUGRUCell(input_size, hidden_size, bias)
+
+    def forward(self, input, att_scores=None, hidden_output=None):
+        if not isinstance(input, PackedSequence) or not isinstance(att_scores, PackedSequence):
+            raise NotImplementedError("DynamicRNN only supports packed input and att_scores")
+
+        input, batch_sizes, sorted_indices, unsorted_indices = input
+        att_scores = att_scores.data
+
+        max_batch_size = int(batch_sizes[0])
+        if hidden_output is None:
+            hidden_output = torch.zeros(max_batch_size, self.hidden_size, dtype=input.dtype, device=input.device)
+
+        outputs = torch.zeros(input.size(0), self.hidden_size, dtype=input.dtype, device=input.device)
+
+        begin = 0
+        for batch in batch_sizes:
+            new_hx = self.rnn(input[begin:begin + batch], hidden_output[0:batch], att_scores[begin:begin + batch])
+            outputs[begin:begin + batch] = new_hx
+            hidden_output = new_hx
+            begin += batch
+
+        return PackedSequence(outputs, batch_sizes, sorted_indices, unsorted_indices)
+class AUGRUCell(nn.Module):
+    """ Effect of GRU with attentional update gate (AUGRU). AUGRU combines attention mechanism and GRU seamlessly.
+
+    Formally:
+        ..math: \tilde{{u}}_{t}^{\prime}=a_{t} * {u}_{t}^{\prime} \\
+                {h}_{t}^{\prime}=\left(1-\tilde{{u}}_{t}^{\prime}\right) \circ {h}_{t-1}^{\prime}+\tilde{{u}}_{t}^{\prime} \circ \tilde{{h}}_{t}^{\prime}
+
+    """
+
+    def __init__(self, input_size, hidden_size, bias=True):
+        super(AUGRUCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        # (W_ir|W_iu|W_ih)
+        self.weight_ih = nn.Parameter(torch.randn(3 * hidden_size, input_size))
+        # (W_hr|W_hu|W_hh)
+        self.weight_hh = nn.Parameter(torch.randn(3 * hidden_size, hidden_size))
+        if bias:
+            # (b_ir|b_iu|b_ih)
+            self.bias_ih = nn.Parameter(torch.zeros(3 * hidden_size))
+            # (b_hr|b_hu|b_hh)
+            self.bias_hh = nn.Parameter(torch.zeros(3 * hidden_size))
+        else:
+            self.register_parameter('bias_ih', None)
+            self.register_parameter('bias_hh', None)
+
+    def forward(self, input, hidden_output, att_score):
+        gi = F.linear(input, self.weight_ih, self.bias_ih)
+        gh = F.linear(hidden_output, self.weight_hh, self.bias_hh)
+        i_r, i_u, i_h = gi.chunk(3, 1)
+        h_r, h_u, h_h = gh.chunk(3, 1)
+
+        reset_gate = torch.sigmoid(i_r + h_r)
+        update_gate = torch.sigmoid(i_u + h_u)
+        new_state = torch.tanh(i_h + reset_gate * h_h)
+
+        att_score = att_score.view(-1, 1)
+        update_gate = att_score * update_gate
+        hy = (1 - update_gate) * hidden_output + update_gate * new_state
+
+        return hy

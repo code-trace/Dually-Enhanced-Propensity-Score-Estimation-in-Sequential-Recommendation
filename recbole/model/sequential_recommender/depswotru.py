@@ -86,12 +86,12 @@ class Timeware_Propensity_Estimation(nn.Module):
 
 
 
-class DEPS(SequentialRecommender):
+class DEPSWOTRU(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(DEPSWOTRU, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -175,7 +175,7 @@ class DEPS(SequentialRecommender):
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
-        self.mlp_hidden_size = [4 * self.hidden_size] + self.mlp_hidden_size
+        self.mlp_hidden_size = [2 * self.hidden_size] + self.mlp_hidden_size
 
         self.dnn_mlp_layers = MLPLayers(self.mlp_hidden_size, activation='Dice', dropout=self.dropout_prob, bn=True)
         self.dnn_predict_layers = nn.Linear(self.mlp_hidden_size[-1], 1)
@@ -448,9 +448,10 @@ class DEPS(SequentialRecommender):
         user_history_emb = torch.mean(item_output*((masked_item_seq>0).float().view(masked_item_seq.size(0),-1,1)),dim=1,keepdim=False)
 
 
-        item_emb = torch.cat((item_social_emb,target_item_feat_emb),dim=-1)
-        user_emb = torch.cat((user_history_emb,target_user_feat_emb),dim=-1)
-        in_r = torch.cat([user_emb, item_emb], dim=-1)
+        # item_emb = torch.cat((item_social_emb,target_item_feat_emb),dim=-1)
+        # user_emb = torch.cat((user_history_emb,target_user_feat_emb),dim=-1)
+        # in_r = torch.cat([user_emb, item_emb], dim=-1)
+        in_r = torch.cat([user_history_emb, target_item_feat_emb], dim=-1)
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         preds = self.sigmoid(preds).squeeze(1)
@@ -480,7 +481,7 @@ class DEPS(SequentialRecommender):
                 else:
                     return item_IPS_loss  + user_IPS_loss + dual_loss
             else:
-                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss + dual_loss
+                return item_mlm_loss+  item_IPS_loss + user_IPS_loss + dual_loss
 
         return loss
 
@@ -497,7 +498,8 @@ class DEPS(SequentialRecommender):
                                                                                                                    item_seq_len=item_seq_len,user_seq_len=user_seq_len)
         item_emb = torch.cat((torch.mean(user_output*((user_seq >0).float().view(user_seq.size(0),-1,1)),dim=1,keepdim=False),target_item_feat_emb),dim=-1)
         user_emb = torch.cat((torch.mean(item_output*((item_seq >0).float().view(item_seq.size(0),-1,1)),dim=1,keepdim=False),target_user_feat_emb),dim=-1)
-        in_r = torch.cat([user_emb, item_emb], dim=-1)
+        #in_r = torch.cat([user_emb, item_emb], dim=-1)
+        in_r =user_emb
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         scores = self.sigmoid(preds).squeeze(1)

@@ -1,28 +1,7 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2021/12/20 12:08
-# @Author  : Chen Xu
-# @Email   : xc_chen@ruc.edu.cn
 
-r"""
-@inproceedings{10.1145/3511808.3557299,
-author = {Xu, Chen and Xu, Jun and Chen, Xu and Dong, Zhenghua and Wen, Ji-Rong},
-title = {Dually Enhanced Propensity Score Estimation in Sequential Recommendation},
-year = {2022},
-isbn = {9781450392365},
-publisher = {Association for Computing Machinery},
-address = {New York, NY, USA},
-url = {https://doi.org/10.1145/3511808.3557299},
-doi = {10.1145/3511808.3557299},
-abstract = {Sequential recommender systems train their models based on a large amount of implicit user feedback data and may be subject to biases when users are systematically under/over-exposed to certain items. Unbiased learning based on inverse propensity scores (IPS), which estimate the probability of observing a user-item pair given the historical information, has been proposed to address the issue. In these methods, propensity score estimation is usually limited to the view of item, that is, treating the feedback data as sequences of items that interacted with the users. However, the feedback data can also be treated from the view of user, as the sequences of users that interact with the items. Moreover, the two views can jointly enhance the propensity score estimation. Inspired by the observation, we propose to estimate the propensity scores from the views of user and item, called Dually Enhanced Propensity Score Estimation (DEPS). Specifically, given a target user-item pair and the corresponding item and user interaction sequences, DEPS first constructs a time-aware causal graph to represent the user-item observational probability. According to the graph, two complementary propensity scores are estimated from the views of item and user, respectively, based on the same set of user feedback data. Finally, two transformers are designed to make use of the two propensity scores and make the final preference prediction. Theoretical analysis showed the unbiasedness and variance of DEPS. Experimental results on three publicly available benchmarks and a proprietary industrial dataset demonstrated that DEPS can significantly outperform the state-of-the-art baselines.},
-booktitle = {Proceedings of the 31st ACM International Conference on Information & Knowledge Management},
-pages = {2260–2269},
-numpages = {10},
-keywords = {propensity score estimation, sequential recommendation},
-location = {Atlanta, GA, USA},
-series = {CIKM '22}
-}
 
-"""
+
 
 import random
 
@@ -68,30 +47,28 @@ class Timeware_Propensity_Estimation(nn.Module):
     def forward(self,item_seq_emb, target_item, item_emb, seq_len):
         ##IPS not need to backward to the underlying model
         item_emb = item_emb.detach()
-        #（掩码 + 位置）
         item_seq_emb = item_seq_emb.detach()
         gru_output, _ = self.gru_layers(item_seq_emb)
         gru_output = self.dense1(gru_output)
         seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len),seq_len - 1))
-        #乘embedding的权重参数item_emb
         logits = torch.matmul(seq_output, item_emb.transpose(0, 1))
 
         IPS_score = torch.softmax(logits,dim=-1)
 
         IPS_score = IPS_score.gather(dim=-1,index=target_item.unsqueeze(-1))
         loss = self.loss(logits, target_item)
-        # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
-        # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
+        print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
+        seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
         return IPS_score, loss, logits
 
 
 
-class DEPS(SequentialRecommender):
+class TRDEPS(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(TRDEPS, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -131,8 +108,8 @@ class DEPS(SequentialRecommender):
         #self.cls_token = 1
         self.dataset = dataset
 
-        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
-        self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
+        #self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
+        #self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
 
 
         self.types = ['user', 'item']
@@ -401,7 +378,7 @@ class DEPS(SequentialRecommender):
         times = interaction[self.TIME]
         user = interaction[self.USER_ID]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        #这个为什么是数字，位置吗
+
         next_items = interaction[self.ITEM_ID]
         #user_seq为不同item下的用户序列，user_seq_len为每个iten下的用户序列长度
         user_seq,user_seq_len = self.GetUserSeq(next_items,times)
@@ -461,13 +438,24 @@ class DEPS(SequentialRecommender):
         user_mlm_loss = torch.sum(loss_fct(user_logits.view(-1, test_user_emb.size(0)), pos_users.view(-1)) * user_targets) \
                         / torch.sum(user_targets)
 
-
-        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb,next_items,test_item_emb,item_seq_len)
-        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
+        ###
+        itemseq_output = self.gather_indexes(item_output, torch.max(torch.zeros_like(item_seq_len), item_seq_len - 1))
+        itemlogits = torch.matmul(itemseq_output, test_item_emb.transpose(0, 1))
+        p_item_score = torch.softmax(itemlogits, dim=-1)
+        p_item_score = p_item_score.gather(dim=-1, index=next_items.unsqueeze(-1))
+        item_IPS_loss = nn.CrossEntropyLoss()(itemlogits, next_items)
+        userseq_output = self.gather_indexes(user_output, torch.max(torch.zeros_like(user_seq_len), user_seq_len - 1))
+        userlogits = torch.matmul(userseq_output, test_user_emb.transpose(0, 1))
+        p_user_score = torch.softmax(userlogits, dim=-1)
+        p_user_score = p_user_score.gather(dim=-1, index=user.unsqueeze(-1))
+        user_IPS_loss =nn.CrossEntropyLoss()(userlogits, user)
+        ###
+        #p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb,next_items,test_item_emb,item_seq_len)
+        #p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
         dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
         #dual_loss = nn.MSELoss()(item_IPS_loss,user_IPS_loss)
         loss = self.loss(preds,label,p_item_score,p_user_score)
-        print(f"item_IPS_loss:{item_IPS_loss}，user_IPS_loss:{user_IPS_loss},dual_loss:{dual_loss}\
+        print(f"p_item_score:{p_item_score[:4,]}，p_user_score:{p_user_score[:4,]},dual_loss:{dual_loss}\
         ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
         if self.training:
             self.current_step = self.current_step + 1

@@ -86,12 +86,12 @@ class Timeware_Propensity_Estimation(nn.Module):
 
 
 
-class DEPS(SequentialRecommender):
+class DEPSWOIPS(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(DEPS, self).__init__(config, dataset)
+        super(DEPSWOIPS, self).__init__(config, dataset)
 
         # load parameters info
         self.n_layers = config['n_layers']
@@ -131,8 +131,8 @@ class DEPS(SequentialRecommender):
         #self.cls_token = 1
         self.dataset = dataset
 
-        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
-        self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
+        #self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
+        #self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob)
 
 
         self.types = ['user', 'item']
@@ -192,8 +192,6 @@ class DEPS(SequentialRecommender):
 
         self.current_step = 0
 
-        self.loss = IPSDualBCELoss(clip=config['IPS_clip'],max_clip=config['IPS_max_clip'],
-                                   total_steps=self.total_step, warmup_rate=self.warmup_rate,alpha=config['alpha'])
 
         self.apply(self._init_weights)
 
@@ -462,25 +460,22 @@ class DEPS(SequentialRecommender):
                         / torch.sum(user_targets)
 
 
-        p_item_score, item_IPS_loss, item_logits = self.ItemIPS_Estimation_Net(item_seq_emb,next_items,test_item_emb,item_seq_len)
-        p_user_score, user_IPS_loss, user_logits = self.UserIPS_Estimation_Net(user_seq_emb,user,test_user_emb,user_seq_len)
-        dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
+
         #dual_loss = nn.MSELoss()(item_IPS_loss,user_IPS_loss)
-        loss = self.loss(preds,label,p_item_score,p_user_score)
-        print(f"item_IPS_loss:{item_IPS_loss}，user_IPS_loss:{user_IPS_loss},dual_loss:{dual_loss}\
-        ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
+        loss = F.binary_cross_entropy(preds, label, reduction='mean')
+
         if self.training:
             self.current_step = self.current_step + 1
-            self.loss.update()
+
             if self.current_step > self.warmup_rate * self.total_step:
                 #unbiased learning phrase
                 self.mask_ratio = self.min_mask_ratio
                 if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
                     return loss
                 else:
-                    return item_IPS_loss  + user_IPS_loss + dual_loss
+                    return loss
             else:
-                return item_mlm_loss+user_mlm_loss +  item_IPS_loss + user_IPS_loss + dual_loss
+                return item_mlm_loss+user_mlm_loss
 
         return loss
 
