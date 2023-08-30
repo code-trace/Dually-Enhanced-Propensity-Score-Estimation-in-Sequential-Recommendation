@@ -65,7 +65,7 @@ class SimpleRetention(nn.Module):
         # V: (batch_size, 1, v_dim)
         # s_n = gamma * s_n_1 + K^T @ V
 
-        s_n = self.gamma * s_n_1 + (K.transpose(-1, -2) @ V)
+        s_n = self.gamma * s_n_1.to(K.device) + (K.transpose(-1, -2) @ V)
         
         return (Q @ s_n), s_n
     
