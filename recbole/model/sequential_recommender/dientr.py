@@ -39,7 +39,7 @@ import numpy as np
 
 import pandas as pd
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
-
+from recbole.model.sequential_recommender.retnet import RetNet
 
 
 
@@ -53,6 +53,8 @@ class Timeware_Propensity_Estimation(nn.Module):
         self.gru = config['gru_type']
         self.embedding_size = config['embedding_size']
         self.mlp_hidden_size = config['mlp_hidden_size']
+        self.hidden_dropout_prob = config['hidden_dropout_prob']
+        self.layer_norm_eps = config['layer_norm_eps']
         self.max_seq_length = max_seq_length
         self.gru_layers = nn.GRU(
             input_size=self.hidden_size,
@@ -74,6 +76,8 @@ class Timeware_Propensity_Estimation(nn.Module):
         self.dense1 = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.loss = nn.CrossEntropyLoss()
+        self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
     def gather_indexes(self, output, gather_index):
         gather_index = gather_index.view(-1, 1, 1).expand(-1, -1, output.shape[-1])
@@ -82,10 +86,11 @@ class Timeware_Propensity_Estimation(nn.Module):
 
     def forward(self,item_seq_emb, target_item, item_emb, seq_len,target_item_feat_emb,tr_output):
         ##IPS not need to backward to the underlying model
-        item_emb = item_emb
+        item_emb = item_emb.detach()
         #（掩码 + 位置）
-        item_seq_emb = item_seq_emb
-        target_item_feat_emb=target_item_feat_emb
+        item_seq_emb = item_seq_emb.detach()
+        target_item_feat_emb=target_item_feat_emb.detach()
+        tr_output=tr_output.detach()
         gru_output, _ = self.gru_layers(item_seq_emb)
         gru_output = self.dense1(gru_output)
         seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len),seq_len - 1))
@@ -99,6 +104,8 @@ class Timeware_Propensity_Estimation(nn.Module):
         # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
         # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
         #return IPS_score, loss, logits
+        gru_output = self.dropout(gru_output)
+        gru_output = self.LayerNorm(gru_output + item_seq_emb)
         evolution = self.interest_evolution(target_item_feat_emb, gru_output, seq_len,tr_output)
 
         # dien_in = torch.cat([evolution, target_item_feat_emb, user_feat_list], dim=-1)
@@ -108,9 +115,7 @@ class Timeware_Propensity_Estimation(nn.Module):
         # preds = self.sigmoid(preds)
 
         #return preds.squeeze(1), aux_loss
-        if torch.isnan(aux_loss):
-            aux_loss=0
-            print("aux_loss为nan")
+
         return aux_loss,evolution
 
 class DIENTR(SequentialRecommender):
@@ -177,28 +182,29 @@ class DIENTR(SequentialRecommender):
         self.item_position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
         self.user_position_embedding = nn.Embedding(self.max_user_seq_length, self.hidden_size)
 
-        self.item_encoder = TransformerEncoder(
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            hidden_size=self.hidden_size,
-            inner_size=self.inner_size,
-            hidden_dropout_prob=self.hidden_dropout_prob,
-            attn_dropout_prob=self.attn_dropout_prob,
-            hidden_act=self.hidden_act,
-            layer_norm_eps=self.layer_norm_eps
-        )
-
-        self.user_encoder = TransformerEncoder(
-            n_layers=self.n_layers,
-            n_heads=self.n_heads,
-            hidden_size=self.hidden_size,
-            inner_size=self.inner_size,
-            hidden_dropout_prob=self.hidden_dropout_prob,
-            attn_dropout_prob=self.attn_dropout_prob,
-            hidden_act=self.hidden_act,
-            layer_norm_eps=self.layer_norm_eps
-        )
-
+        # self.item_encoder = TransformerEncoder(
+        #     n_layers=self.n_layers,
+        #     n_heads=self.n_heads,
+        #     hidden_size=self.hidden_size,
+        #     inner_size=self.inner_size,
+        #     hidden_dropout_prob=self.hidden_dropout_prob,
+        #     attn_dropout_prob=self.attn_dropout_prob,
+        #     hidden_act=self.hidden_act,
+        #     layer_norm_eps=self.layer_norm_eps
+        # )
+        #
+        # self.user_encoder = TransformerEncoder(
+        #     n_layers=self.n_layers,
+        #     n_heads=self.n_heads,
+        #     hidden_size=self.hidden_size,
+        #     inner_size=self.inner_size,
+        #     hidden_dropout_prob=self.hidden_dropout_prob,
+        #     attn_dropout_prob=self.attn_dropout_prob,
+        #     hidden_act=self.hidden_act,
+        #     layer_norm_eps=self.layer_norm_eps
+        # )
+        self.item_retnet = RetNet(self.n_layers, self.hidden_size, self.inner_size, self.n_heads, double_v_dim=True)
+        self.user_retnet = RetNet(self.n_layers, self.hidden_size, self.inner_size, self.n_heads, double_v_dim=True)
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
@@ -382,21 +388,27 @@ class DIENTR(SequentialRecommender):
         input_emb_item = self.dropout(input_emb_item)
         extended_attention_mask = self.get_attention_mask(item_seq,item_seq_len)
 
-        #print(extended_attention_mask[0:2])
-        item_output = self.item_encoder(input_emb_item, extended_attention_mask, output_all_encoded_layers=True)
-        item_output = item_output[-1]
+        # print(extended_attention_mask[0:2])
+        # item_output = self.item_encoder(input_emb_item, extended_attention_mask, output_all_encoded_layers=True)
+        item_feat_list = self.LayerNorm(item_feat_list)
+        item_feat_list = self.dropout(item_feat_list)
+        item_output = self.item_retnet(item_feat_list)
+        # item_output = item_output[-1]
 
         position_ids = torch.arange(self.max_user_seq_length, dtype=torch.long, device=user_seq.device)
         position_ids = position_ids.unsqueeze(0).expand_as(user_seq)
         position_embedding = self.user_position_embedding(position_ids)
-        #label_embedding = self.user_label_embedding(user_label_seq)
+        # label_embedding = self.user_label_embedding(user_label_seq)
 
         input_emb_user = user_feat_list + position_embedding
         input_emb_user = self.LayerNorm(input_emb_user)
         input_emb_user = self.dropout(input_emb_user)
         extended_attention_mask = self.get_attention_mask(user_seq, user_seq_len)
-        user_output = self.user_encoder(input_emb_user, extended_attention_mask, output_all_encoded_layers=True)
-        user_output = user_output[-1]
+        # user_output = self.user_encoder(input_emb_user, extended_attention_mask, output_all_encoded_layers=True)
+        user_feat_list = self.LayerNorm(user_feat_list)
+        user_feat_list = self.dropout(user_feat_list)
+        user_output = self.user_retnet(user_feat_list)
+        # user_output = user_output[-1]
 
         #exit(0)
         return item_output,target_item_feat_emb,user_output,target_user_feat_emb,input_emb_item,input_emb_user  # [B H]
@@ -493,7 +505,7 @@ class DIENTR(SequentialRecommender):
                         / torch.sum(user_targets)
 
         #pred = preds[preds.isnan()] = 0
-        dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
+        #dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
         print(f"predsshape:{preds},labelsshape:{label}")
         loss = F.binary_cross_entropy(preds, label, reduction='mean')
         # if torch.isnan(loss):
@@ -511,9 +523,9 @@ class DIENTR(SequentialRecommender):
                 if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
                     return loss
                 else:
-                    return item_IPS_loss+user_IPS_loss+dual_loss
+                    return loss
             else:
-                return item_mlm_loss+user_mlm_loss+item_IPS_loss+user_IPS_loss+dual_loss
+                return item_mlm_loss+user_mlm_loss
 
         return loss
 

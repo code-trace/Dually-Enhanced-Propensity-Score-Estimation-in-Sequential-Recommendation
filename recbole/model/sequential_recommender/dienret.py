@@ -53,6 +53,8 @@ class Timeware_Propensity_Estimation(nn.Module):
         self.gru = config['gru_type']
         self.embedding_size = config['embedding_size']
         self.mlp_hidden_size = config['mlp_hidden_size']
+        self.hidden_dropout_prob = config['hidden_dropout_prob']
+        self.layer_norm_eps = config['layer_norm_eps']
         self.max_seq_length = max_seq_length
         self.gru_layers = nn.GRU(
             input_size=self.hidden_size,
@@ -74,6 +76,8 @@ class Timeware_Propensity_Estimation(nn.Module):
         self.dense1 = nn.Linear(self.hidden_size, self.hidden_size)
         self.linear1 = nn.Linear(self.hidden_size, 1)
         self.loss = nn.CrossEntropyLoss()
+        self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
     def gather_indexes(self, output, gather_index):
         gather_index = gather_index.view(-1, 1, 1).expand(-1, -1, output.shape[-1])
@@ -86,6 +90,8 @@ class Timeware_Propensity_Estimation(nn.Module):
         #（掩码 + 位置）
         item_seq_emb = item_seq_emb.detach()
         target_item_feat_emb=target_item_feat_emb.detach()
+        item_seq_emb = self.LayerNorm(item_seq_emb)
+        item_seq_emb = self.dropout(item_seq_emb)
         gru_output, _ = self.gru_layers(item_seq_emb)
         gru_output = self.dense1(gru_output)
         seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len),seq_len - 1))
@@ -99,6 +105,9 @@ class Timeware_Propensity_Estimation(nn.Module):
         # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
         # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
         #return IPS_score, loss, logits
+        gru_output = self.dropout(gru_output)
+        gru_output = self.LayerNorm(gru_output+item_seq_emb)
+
         evolution,rnnout = self.interest_evolution(target_item_feat_emb, gru_output, seq_len)
         attention_mask = (item_seq > 0).long()  # [B,L]
         extended_attention_mask = attention_mask.unsqueeze(-1)  # torch.int64
@@ -500,12 +509,12 @@ class DIENRET(SequentialRecommender):
         user_mlm_loss = torch.sum(loss_fct(user_logits.view(-1, test_user_emb.size(0)), pos_users.view(-1)) * user_targets) \
                         / torch.sum(user_targets)
 
-        print(f"predsshape:{preds},labelsshape:{label}")
+        #print(f"predsshape:{preds},labelsshape:{label}")
         dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
         #loss = F.binary_cross_entropy(preds, label, reduction='mean')
         loss = self.loss(preds,label,itemIPS_score,userIPS_score)
-        # print(f"item_IPS_loss:{item_IPS_loss}，\
-        # ,item_mlm_loss:{item_mlm_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
+        print(f"item_IPS_loss:{item_IPS_loss}，\
+        ,user_IPS_loss:{user_IPS_loss},user_mlm_loss:{user_mlm_loss},loss:{loss}")
         if self.training:
             self.current_step = self.current_step + 1
             self.loss.update()
@@ -513,9 +522,9 @@ class DIENRET(SequentialRecommender):
                 #unbiased learning phrase
                 self.mask_ratio = self.min_mask_ratio
                 if self.current_step % (self.batch_step*(1+self.IPS_training_rate)) <= self.batch_step:
-                    return loss*20+item_IPS_loss+user_IPS_loss+dual_loss
+                    return loss
                 else:
-                    return loss*20+item_IPS_loss+user_IPS_loss+dual_loss
+                    return item_IPS_loss+user_IPS_loss+dual_loss
             else:
                 return item_mlm_loss+user_mlm_loss +  item_IPS_loss+user_IPS_loss+dual_loss
 
