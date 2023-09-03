@@ -44,7 +44,7 @@ from recbole.model.sequential_recommender.retnet import RetNet
 
 
 class Timeware_Propensity_Estimation(nn.Module):
-    def __init__(self, hidden_size, dropout_prob,config,dataset,max_seq_length,num_layer = 2):
+    def __init__(self, hidden_size, dropout_prob,config,dataset,max_seq_length,n_items,n_users,num_layer = 1):
         super(Timeware_Propensity_Estimation, self).__init__()
         #Since the transformer already encode the sequence information, we only need to calculate the item probability through two layer MLP
         self.hidden_size = hidden_size
@@ -56,7 +56,14 @@ class Timeware_Propensity_Estimation(nn.Module):
         self.hidden_dropout_prob = config['hidden_dropout_prob']
         self.layer_norm_eps = config['layer_norm_eps']
         self.max_seq_length = max_seq_length
-        self.gru_layers = nn.GRU(
+        self.itemgru_layers = nn.GRU(
+            input_size=self.hidden_size,
+            hidden_size=self.hidden_size,
+            num_layers=num_layer,
+            bias=False,
+            batch_first=True,
+        )
+        self.usergru_layers = nn.GRU(
             input_size=self.hidden_size,
             hidden_size=self.hidden_size,
             num_layers=num_layer,
@@ -70,53 +77,49 @@ class Timeware_Propensity_Estimation(nn.Module):
         mask_mat = torch.arange(self.max_seq_length).to(self.device).view(1, -1)  # init mask
         # init sizes of used layers
         self.att_list = [4  * self.hidden_size] + self.mlp_hidden_size
-        self.interest_evolution = InterestEvolvingLayer(
-            mask_mat, item_feat_dim, item_feat_dim, self.att_list, gru=self.gru
-        )
+        self.iteminterest_evolution = InterestEvolvingLayer( mask_mat, item_feat_dim, item_feat_dim, self.att_list, gru=self.gru)
+        self.userinterest_evolution = InterestEvolvingLayer(mask_mat, item_feat_dim, item_feat_dim, self.att_list, gru=self.gru)
         self.dense1 = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.loss = nn.CrossEntropyLoss()
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
+        self.item_embedding = nn.Embedding(n_items + 1, hidden_size, padding_idx=0)  # mask token add 1
+        self.user_embedding = nn.Embedding(n_users + 1, hidden_size, padding_idx=0)  # mask token add 1
+        self.item_retnet = RetNet(num_layer, self.hidden_size, self.hidden_size*4, 2, double_v_dim=True)
+        self.user_retnet = RetNet(num_layer, self.hidden_size, self.hidden_size*4, 2, double_v_dim=True)
 
     def gather_indexes(self, output, gather_index):
         gather_index = gather_index.view(-1, 1, 1).expand(-1, -1, output.shape[-1])
         output_tensor = output.gather(dim=1, index=gather_index)
         return output_tensor.squeeze(1)
 
-    def forward(self,item_seq_emb, target_item, item_emb, seq_len,target_item_feat_emb,tr_output):
+    def forward(self,user, item_seq, next_items, user_seq, item_seq_len, user_seq_len):
         ##IPS not need to backward to the underlying model
-        item_emb = item_emb.detach()
-        #（掩码 + 位置）
-        item_seq_emb = item_seq_emb.detach()
-        target_item_feat_emb=target_item_feat_emb.detach()
-        tr_output=tr_output.detach()
-        gru_output, _ = self.gru_layers(item_seq_emb)
-        gru_output = self.dense1(gru_output)
-        seq_output = self.gather_indexes(gru_output, torch.max(torch.zeros_like(seq_len),seq_len - 1))
-        #乘embedding的权重参数item_emb
-        logits = torch.matmul(seq_output, item_emb.transpose(0, 1))
 
-        IPS_score = torch.softmax(logits,dim=-1)
 
-        IPS_score = IPS_score.gather(dim=-1,index=target_item.unsqueeze(-1))
-        aux_loss = self.loss(logits, target_item)
-        # print(f"item_emb:{item_emb.shape},item_seq_emb:{item_seq_emb.shape},gru_output:{gru_output.shape},\
-        # seq_output:{seq_output.shape},logits:{logits.shape},target_item:{target_item.shape},IPS_score:{IPS_score.shape},loss:{loss}")
-        #return IPS_score, loss, logits
-        gru_output = self.dropout(gru_output)
-        gru_output = self.LayerNorm(gru_output + item_seq_emb)
-        evolution = self.interest_evolution(target_item_feat_emb, gru_output, seq_len,tr_output)
+        item_feat_list = self.item_embedding(item_seq)
+        target_item_feat_emb = self.item_embedding(next_items)
+        user_feat_list = self.user_embedding(user_seq)
+        target_user_feat_emb = self.user_embedding(user)
 
-        # dien_in = torch.cat([evolution, target_item_feat_emb, user_feat_list], dim=-1)
-        # # input the DNN to get the prediction score
-        # dien_out = self.dnn_mlp_layers(dien_in)
-        # preds = self.dnn_predict_layer(dien_out)
-        # preds = self.sigmoid(preds)
+        itemgru_output, _ = self.itemgru_layers(item_feat_list)
+        itemgru_output = self.dense1(itemgru_output)
+        itemgru_output = self.dropout(itemgru_output)
+        itemgru_output = self.LayerNorm(itemgru_output + item_feat_list)
+        itemtr_output = self.item_retnet(item_feat_list)
+        item_output = self.iteminterest_evolution(itemtr_output, itemtr_output)
 
-        #return preds.squeeze(1), aux_loss
+        usergru_output, _ = self.usergru_layers(user_feat_list)
+        usergru_output = self.dense1(usergru_output)
+        usergru_output = self.dropout(usergru_output)
+        usergru_output = self.LayerNorm(usergru_output + user_feat_list)
+        usertr_output = self.user_retnet(user_feat_list)
+        user_output = self.userinterest_evolution(usergru_output, usertr_output)
 
-        return aux_loss,evolution
+
+
+        return item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_feat_list,user_feat_list
 
 class DIENTR(SequentialRecommender):
 
@@ -156,6 +159,8 @@ class DIENTR(SequentialRecommender):
         self.IPS_factor = config['IPS_factor']
 
         self.data_type = config['dataset']
+        self.pooling_mode = config['pooling_mode']
+        self.device = config['device']
 
         # load dataset info
         self.item_mask_token = self.n_items
@@ -163,8 +168,8 @@ class DIENTR(SequentialRecommender):
         #self.cls_token = 1
         self.dataset = dataset
 
-        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob,config =config,dataset=dataset,max_seq_length=self.max_seq_length)
-        self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob,config =config,dataset=dataset,max_seq_length=self.max_user_seq_length )
+        self.ItemIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob,config =config,dataset=dataset,max_seq_length=self.max_seq_length,n_items=self.n_items,n_users=self.n_users)
+        #self.UserIPS_Estimation_Net = Timeware_Propensity_Estimation(hidden_size=self.hidden_size,dropout_prob=self.dropout_prob,config =config,dataset=dataset,max_seq_length=self.max_user_seq_length )
 
 
         self.types = ['user', 'item']
@@ -173,14 +178,7 @@ class DIENTR(SequentialRecommender):
 
         self.DualLoss = nn.MSELoss()
 
-        self.item_embedding = nn.Embedding(self.n_items + 1, self.hidden_size, padding_idx=0)  # mask token add 1
-        self.user_embedding = nn.Embedding(self.n_users + 1, self.hidden_size, padding_idx=0)  # mask token add 1
 
-        self.pooling_mode = config['pooling_mode']
-        self.device = config['device']
-
-        self.item_position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
-        self.user_position_embedding = nn.Embedding(self.max_user_seq_length, self.hidden_size)
 
         # self.item_encoder = TransformerEncoder(
         #     n_layers=self.n_layers,
@@ -203,12 +201,11 @@ class DIENTR(SequentialRecommender):
         #     hidden_act=self.hidden_act,
         #     layer_norm_eps=self.layer_norm_eps
         # )
-        self.item_retnet = RetNet(self.n_layers, self.hidden_size, self.inner_size, self.n_heads, double_v_dim=True)
-        self.user_retnet = RetNet(self.n_layers, self.hidden_size, self.inner_size, self.n_heads, double_v_dim=True)
+
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
-        self.mlp_hidden_size = [6 * self.hidden_size] + self.mlp_hidden_size
+        self.mlp_hidden_size = [4 * self.hidden_size] + self.mlp_hidden_size
 
         self.dnn_mlp_layers = MLPLayers(self.mlp_hidden_size, activation='Dice', dropout=self.dropout_prob, bn=True)
         self.dnn_predict_layers = nn.Linear(self.mlp_hidden_size[-1], 1)
@@ -372,46 +369,12 @@ class DIENTR(SequentialRecommender):
 
     def forward(self, user, item_seq, next_items, user_seq, item_seq_len, user_seq_len):
 
-        target_user_feat_emb = self.user_embedding(user)
-        user_feat_list = self.user_embedding(user_seq)
 
-        item_feat_list = self.item_embedding(item_seq)
-        target_item_feat_emb = self.item_embedding(next_items)
 
-        position_ids = torch.arange(self.max_seq_length, dtype=torch.long, device=item_seq.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
-        position_embedding = self.item_position_embedding(position_ids)
-        #label_embedding = self.item_label_embedding(item_label_seq)
 
-        input_emb_item = item_feat_list + position_embedding
-        input_emb_item = self.LayerNorm(input_emb_item)
-        input_emb_item = self.dropout(input_emb_item)
-        extended_attention_mask = self.get_attention_mask(item_seq,item_seq_len)
-
-        # print(extended_attention_mask[0:2])
-        # item_output = self.item_encoder(input_emb_item, extended_attention_mask, output_all_encoded_layers=True)
-        item_feat_list = self.LayerNorm(item_feat_list)
-        item_feat_list = self.dropout(item_feat_list)
-        item_output = self.item_retnet(item_feat_list)
-        # item_output = item_output[-1]
-
-        position_ids = torch.arange(self.max_user_seq_length, dtype=torch.long, device=user_seq.device)
-        position_ids = position_ids.unsqueeze(0).expand_as(user_seq)
-        position_embedding = self.user_position_embedding(position_ids)
-        # label_embedding = self.user_label_embedding(user_label_seq)
-
-        input_emb_user = user_feat_list + position_embedding
-        input_emb_user = self.LayerNorm(input_emb_user)
-        input_emb_user = self.dropout(input_emb_user)
-        extended_attention_mask = self.get_attention_mask(user_seq, user_seq_len)
-        # user_output = self.user_encoder(input_emb_user, extended_attention_mask, output_all_encoded_layers=True)
-        user_feat_list = self.LayerNorm(user_feat_list)
-        user_feat_list = self.dropout(user_feat_list)
-        user_output = self.user_retnet(user_feat_list)
-        # user_output = user_output[-1]
 
         #exit(0)
-        return item_output,target_item_feat_emb,user_output,target_user_feat_emb,input_emb_item,input_emb_user  # [B H]
+        return None  # [B H]
 
     def multi_hot_embed(self, masked_index, max_length):
         """
@@ -453,9 +416,16 @@ class DIENTR(SequentialRecommender):
         masked_item_seq, pos_items, masked_item_index = self.reconstruct_train_data(item_seq,self.mask_item_length, pad_item=True)
         masked_user_seq, pos_users, masked_user_index = self.reconstruct_train_data(user_seq,self.mask_user_length ,pad_item=False)
 
-        item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=masked_item_seq, next_items=next_items, user_seq=masked_user_seq,
+        # item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=masked_item_seq, next_items=next_items, user_seq=masked_user_seq,
+        #                                                                                                            item_seq_len=item_seq_len, user_seq_len=user_seq_len)
+
+
+        item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.ItemIPS_Estimation_Net(user=user, item_seq=masked_item_seq, next_items=next_items, user_seq=masked_user_seq,
                                                                                                                    item_seq_len=item_seq_len, user_seq_len=user_seq_len)
 
+        #user_IPS_loss, user_output = self.UserIPS_Estimation_Net(user_seq_emb, user, test_user_emb, user_seq_len, target_user_feat_emb, user_output)
+        test_user_emb = self.ItemIPS_Estimation_Net.user_embedding.weight[:self.n_users]
+        test_item_emb = self.ItemIPS_Estimation_Net.item_embedding.weight[:self.n_items]
         pred_item_index_map = self.multi_hot_embed(masked_item_index, masked_item_seq.size(-1))  # [B*mask_len max_len]
         # [B mask_len] -> [B mask_len max_len] multi hot
         pred_item_index_map = pred_item_index_map.view(masked_item_index.size(0), masked_item_index.size(1), -1)  # [B mask_len max_len]
@@ -465,8 +435,7 @@ class DIENTR(SequentialRecommender):
 
         loss_fct = nn.CrossEntropyLoss(reduction='none')
         #test_user_emb,test_item_emb = self.embedding_layer.GetAllFeature(self.n_users,self.n_items)
-        test_user_emb = self.user_embedding.weight[:self.n_users]
-        test_item_emb = self.item_embedding.weight[:self.n_items]
+
 
         item_logits = torch.matmul(seq_output, test_item_emb.transpose(0, 1))  # [B mask_len item_num]
         item_targets = (masked_item_index > 0).float().view(-1)  # [B*mask_len]
@@ -489,9 +458,8 @@ class DIENTR(SequentialRecommender):
 
         item_emb = torch.cat((item_social_emb,target_item_feat_emb),dim=-1)
         user_emb = torch.cat((user_history_emb,target_user_feat_emb),dim=-1)
-        item_IPS_loss, item_gruout = self.ItemIPS_Estimation_Net(item_seq_emb, next_items, test_item_emb,item_seq_len,target_item_feat_emb,item_output)
-        user_IPS_loss, user_gruout = self.UserIPS_Estimation_Net(user_seq_emb, user, test_user_emb,user_seq_len,target_user_feat_emb,user_output)
-        in_r = torch.cat([user_emb, item_emb,item_gruout,user_gruout], dim=-1)
+
+        in_r = torch.cat([user_emb, item_emb], dim=-1)
         out_r = self.dnn_mlp_layers(in_r)
 
 
@@ -506,7 +474,7 @@ class DIENTR(SequentialRecommender):
 
         #pred = preds[preds.isnan()] = 0
         #dual_loss = self.DualLoss(item_IPS_loss,user_IPS_loss)
-        print(f"predsshape:{preds},labelsshape:{label}")
+        #print(f"predsshape:{preds}")
         loss = F.binary_cross_entropy(preds, label, reduction='mean')
         # if torch.isnan(loss):
         #     loss=0
@@ -537,17 +505,17 @@ class DIENTR(SequentialRecommender):
         times = interaction[self.TIME]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         user_seq,user_seq_len = self.GetUserSeq(test_item,times)
-        test_item_emb = self.item_embedding.weight[:self.n_items]
-        test_user_emb = self.user_embedding.weight[:self.n_users]
-        item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,
-                                                                                                                   item_seq_len=item_seq_len,user_seq_len=user_seq_len)
+        item_output, target_item_feat_emb, user_output, target_user_feat_emb, item_seq_emb, user_seq_emb = self.ItemIPS_Estimation_Net(
+            user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,item_seq_len=item_seq_len,user_seq_len=user_seq_len)
+        test_item_emb =self.ItemIPS_Estimation_Net.item_embedding.weight[:self.n_items]
+        test_user_emb =self.ItemIPS_Estimation_Net .user_embedding.weight[:self.n_users]
+        # item_output,target_item_feat_emb,user_output,target_user_feat_emb,item_seq_emb,user_seq_emb = self.forward(user=user, item_seq=item_seq, next_items=test_item, user_seq=user_seq,
+        #                                                                                                            item_seq_len=item_seq_len,user_seq_len=user_seq_len)
+
         item_emb = torch.cat((torch.mean(user_output*((user_seq >0).float().view(user_seq.size(0),-1,1)),dim=1,keepdim=False),target_item_feat_emb),dim=-1)
         user_emb = torch.cat((torch.mean(item_output*((item_seq >0).float().view(item_seq.size(0),-1,1)),dim=1,keepdim=False),target_user_feat_emb),dim=-1)
-        item_IPS_loss, item_gruout = self.ItemIPS_Estimation_Net(item_seq_emb, test_item, test_item_emb, item_seq_len,
-                                                                 target_item_feat_emb,item_output)
-        user_IPS_loss, user_gruout = self.UserIPS_Estimation_Net(user_seq_emb, user, test_user_emb, user_seq_len,
-                                                                 target_user_feat_emb,user_output)
-        in_r = torch.cat([user_emb, item_emb,item_gruout,user_gruout], dim=-1)
+
+        in_r = torch.cat([user_emb, item_emb], dim=-1)
         out_r = self.dnn_mlp_layers(in_r)
         preds = self.dnn_predict_layers(out_r)
         scores = self.sigmoid(preds).squeeze(1)
@@ -576,7 +544,7 @@ class InterestEvolvingLayer(nn.Module):
         self.mask_mat = mask_mat
         self.gru = gru
 
-        self.attention_layer = SequenceAttLayer(mask_mat, att_hidden_size, activation, softmax_stag, True)
+       # self.attention_layer = SequenceAttLayer(mask_mat, att_hidden_size, activation, softmax_stag, True)
         self.dynamic_rnn = DynamicRNN(input_size=input_size, hidden_size=rnn_hidden_size, gru=gru)
 
     def final_output(self, outputs, keys_length):
@@ -596,41 +564,19 @@ class InterestEvolvingLayer(nn.Module):
 
         return outputs[mask]
 
-    def forward(self, queries, keys, keys_length,tr_output):
-        hist_len = keys.shape[1]  # T
-        keys_length_cpu = keys_length.cpu()
-        if self.gru == 'GRU':
-            packed_keys = pack_padded_sequence(
-                input=keys, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
-            )
-            packed_rnn_outputs, _ = self.dynamic_rnn(packed_keys)
-            rnn_outputs, _ = pad_packed_sequence(
-                packed_rnn_outputs, batch_first=True, padding_value=0.0, total_length=hist_len
-            )
-            att_outputs = self.attention_layer(queries, rnn_outputs, keys_length)
-            outputs = att_outputs.squeeze(1)
+    def forward(self,  keys,tr_output):
 
-        # AIGRU
-        elif self.gru == 'AIGRU':
-            att_outputs = self.attention_layer(queries, keys, keys_length)
-            interest = keys * att_outputs.transpose(1, 2)
-            packed_rnn_outputs = pack_padded_sequence(
-                interest, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
-            )
-            _, outputs = self.dynamic_rnn(packed_rnn_outputs)
-            outputs = outputs.squeeze(0)
 
-        elif self.gru == 'AGRU' or self.gru == 'AUGRU':
-            att_outputs = self.attention_layer(queries, keys, keys_length).squeeze(1)  # [B, T]
+            #att_outputs = self.attention_layer(queries, keys, keys_length).squeeze(1)  # [B, T]
             # packed_rnn_outputs = pack_padded_sequence(
             #     keys, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
             # )
             # packed_att_outputs = pack_padded_sequence(
             #     att_outputs, lengths=keys_length_cpu, batch_first=True, enforce_sorted=False
             # )
-            outputs = self.dynamic_rnn(keys, tr_output)
+        outputs = self.dynamic_rnn(keys, tr_output)
             #outputs, _ = pad_packed_sequence(outputs, batch_first=True, padding_value=0.0, total_length=hist_len)
-            outputs = self.final_output(outputs, keys_length)  # [B, H]
+            #outputs = self.final_output(outputs, keys_length)  # [B, H]
 
         return outputs
 
